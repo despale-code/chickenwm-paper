@@ -5,6 +5,12 @@
 //! - Paces wallpaper transitions and shader ticks via the Phase 3 Adaptive Frame Scheduler,
 //!   automatically pausing render ticks when obscured by a fullscreen window.
 
+// Release builds are windowed apps: no console window when launched from the shell, a
+// hotkey or the launcher. Debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod layers;
+
 use anyhow::Result;
 use clap::Parser;
 use chickenwm_core::bootstrap_config_and_themes;
@@ -101,6 +107,11 @@ struct PaperState {
     shader_mode: bool,
     shader_time: f32,
     dirty: bool,
+    /// `paper { layer = … }` stack, when configured.
+    layers: Vec<layers::PreparedLayer>,
+    /// Composite of the layers below the first animated one (redrawn only on load).
+    layer_base: Vec<u32>,
+    first_animated: Option<usize>,
 }
 
 impl PaperState {
@@ -117,6 +128,9 @@ impl PaperState {
             shader_mode: false,
             shader_time: 0.0,
             dirty: true,
+            layers: Vec::new(),
+            layer_base: Vec::new(),
+            first_animated: None,
         };
         st.render_procedural_aurora(0.0);
         st.prev_buffer.copy_from_slice(&st.curr_buffer);
@@ -128,6 +142,7 @@ impl PaperState {
         let expanded = expand_home(path_str);
         let path = expanded.as_path();
         self.transition_style = TransitionStyle::from_str(transition);
+        self.clear_layers();
 
         if path_str.to_ascii_lowercase().ends_with(".wgsl") {
             let wgsl_src = if path.exists() {
@@ -169,10 +184,61 @@ impl PaperState {
     }
 
     fn is_animating(&self) -> bool {
-        self.shader_mode || self.transition_progress < 1.0 || self.dirty
+        self.shader_mode || self.first_animated.is_some() || self.transition_progress < 1.0 || self.dirty
+    }
+
+    fn clear_layers(&mut self) {
+        self.layers.clear();
+        self.layer_base.clear();
+        self.first_animated = None;
+    }
+
+    /// Builds the `paper { layer = … }` stack and fades to it. Layers that fail to load are
+    /// skipped (with a warning) so one bad path doesn't blank the wallpaper.
+    fn load_layers(&mut self, config: &[chickenwm_core::config::PaperLayer], palette: &chickenwm_core::theme::Palette) {
+        let mut prepared = Vec::new();
+        for layer in config {
+            match layers::prepare(layer, self.width, self.height, palette, expand_home) {
+                Ok(l) => prepared.push(l),
+                Err(e) => warn!("Skipping wallpaper layer {:?} {}: {e:#}", layer.kind, layer.source),
+            }
+        }
+        self.clear_layers();
+        self.shader_mode = false;
+        self.first_animated = prepared.iter().position(|l| l.animated);
+        self.layers = prepared;
+        let below = self.first_animated.unwrap_or(self.layers.len());
+        let mut base = vec![0xFF00_0000u32; self.curr_buffer.len()];
+        layers::composite(&mut base, &self.layers[..below], 0);
+        self.layer_base = base;
+        self.prev_buffer.copy_from_slice(&self.composite_buffer);
+        self.render_layers();
+        self.transition_style = TransitionStyle::Fade;
+        self.transition_progress = 0.0;
+        self.dirty = true;
+        info!("Loaded {} wallpaper layer(s)", self.layers.len());
+    }
+
+    /// Redraws animated layers at `shader_time` and composites the stack into `curr_buffer`.
+    fn render_layers(&mut self) {
+        self.curr_buffer.copy_from_slice(&self.layer_base);
+        let Some(first) = self.first_animated else { return };
+        let (w, h, t) = (self.width, self.height, self.shader_time);
+        for layer in self.layers[first..].iter_mut().filter(|l| l.animated) {
+            layers::aurora_rgba(&mut layer.rgba, w, h, t);
+            if let Some(key) = layer.config.key {
+                layers::chroma_key(&mut layer.rgba, [key.r, key.g, key.b], layer.config.tolerance, layer.config.softness, layer.config.despill);
+            }
+        }
+        layers::composite(&mut self.curr_buffer, &self.layers, first);
     }
 
     fn step(&mut self, dt: f32) -> bool {
+        if self.first_animated.is_some() {
+            self.shader_time += dt;
+            self.render_layers();
+            self.dirty = true;
+        }
         if self.shader_mode {
             self.shader_time += dt;
             self.render_procedural_aurora(self.shader_time);
@@ -245,6 +311,7 @@ impl PaperState {
 
     /// Shows the palette-generated default wallpaper (fades in from the previous image).
     fn load_generated(&mut self, palette: &chickenwm_core::theme::Palette) {
+        self.clear_layers();
         let rgba = chickenwm_core::wallpaper::render(palette, self.width, self.height);
         self.prev_buffer.copy_from_slice(&self.composite_buffer);
         for (dst, px) in self.curr_buffer.iter_mut().zip(rgba.chunks_exact(4)) {
@@ -362,13 +429,18 @@ fn default_background_image() -> Option<PathBuf> {
 
 /// Loads the first `wallpaper` directive, falling back to the image in `~/.config/chickenwm/bg/`.
 fn load_configured_wallpaper(state: &mut PaperState, cfg: &HyprConfig) {
+    if !cfg.paper.layers.is_empty() {
+        let palette = cfg.theme.palette(cfg.theme.mode);
+        state.load_layers(&cfg.paper.layers, &palette);
+        return;
+    }
     let result = if let Some(wp) = cfg.wallpapers.first() {
         state.load_wallpaper_or_shader(&wp.path, &wp.transition)
     } else if let Some(bg) = default_background_image() {
         state.load_wallpaper_or_shader(&bg.to_string_lossy(), "fade")
     } else {
         // Nothing configured: the generated wallpaper in the current theme's colors.
-        let palette = chickenwm_core::theme::Palette::new(cfg.theme.accent, cfg.theme.mode);
+        let palette = cfg.theme.palette(cfg.theme.mode);
         state.load_generated(&palette);
         return;
     };

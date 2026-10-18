@@ -99,6 +99,9 @@ impl TransitionStyle {
 struct PaperState {
     width: u32,
     height: u32,
+    monitor_name: String,
+    active_workspace: u32,
+    pause_on_battery: bool,
     prev_buffer: Vec<u32>,
     curr_buffer: Vec<u32>,
     composite_buffer: Vec<u32>,
@@ -115,11 +118,14 @@ struct PaperState {
 }
 
 impl PaperState {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, monitor_name: String, pause_on_battery: bool) -> Self {
         let len = (width as usize) * (height as usize);
         let mut st = Self {
             width,
             height,
+            monitor_name,
+            active_workspace: 1,
+            pause_on_battery,
             prev_buffer: vec![0xFF11111Bu32; len],
             curr_buffer: vec![0xFF181825u32; len],
             composite_buffer: vec![0xFF181825u32; len],
@@ -183,8 +189,9 @@ impl PaperState {
         Ok(())
     }
 
-    fn is_animating(&self) -> bool {
-        self.shader_mode || self.first_animated.is_some() || self.transition_progress < 1.0 || self.dirty
+    fn is_animating(&self, pause_shaders: bool) -> bool {
+        let shader_tick = !pause_shaders && (self.shader_mode || self.first_animated.is_some());
+        shader_tick || self.transition_progress < 1.0 || self.dirty
     }
 
     fn clear_layers(&mut self) {
@@ -193,11 +200,10 @@ impl PaperState {
         self.first_animated = None;
     }
 
-    /// Builds the `paper { layer = … }` stack and fades to it. Layers that fail to load are
-    /// skipped (with a warning) so one bad path doesn't blank the wallpaper.
+    /// Builds the `paper { layer = … }` stack matching the active monitor & workspace and fades to it.
     fn load_layers(&mut self, config: &[chickenwm_core::config::PaperLayer], palette: &chickenwm_core::theme::Palette) {
         let mut prepared = Vec::new();
-        for layer in config {
+        for layer in config.iter().filter(|l| l.matches_context(&self.monitor_name, self.active_workspace)) {
             match layers::prepare(layer, self.width, self.height, palette, expand_home) {
                 Ok(l) => prepared.push(l),
                 Err(e) => warn!("Skipping wallpaper layer {:?} {}: {e:#}", layer.kind, layer.source),
@@ -216,7 +222,12 @@ impl PaperState {
         self.transition_style = TransitionStyle::Fade;
         self.transition_progress = 0.0;
         self.dirty = true;
-        info!("Loaded {} wallpaper layer(s)", self.layers.len());
+        info!(
+            "Loaded {} wallpaper layer(s) for monitor={} ws={}",
+            self.layers.len(),
+            self.monitor_name,
+            self.active_workspace
+        );
     }
 
     /// Redraws animated layers at `shader_time` and composites the stack into `curr_buffer`.
@@ -233,13 +244,13 @@ impl PaperState {
         layers::composite(&mut self.curr_buffer, &self.layers, first);
     }
 
-    fn step(&mut self, dt: f32) -> bool {
-        if self.first_animated.is_some() {
+    fn step(&mut self, dt: f32, pause_shaders: bool) -> bool {
+        if !pause_shaders && self.first_animated.is_some() {
             self.shader_time += dt;
             self.render_layers();
             self.dirty = true;
         }
-        if self.shader_mode {
+        if !pause_shaders && self.shader_mode {
             self.shader_time += dt;
             self.render_procedural_aurora(self.shader_time);
             self.composite_buffer.copy_from_slice(&self.curr_buffer);
@@ -427,14 +438,25 @@ fn default_background_image() -> Option<PathBuf> {
     images.into_iter().next()
 }
 
-/// Loads the first `wallpaper` directive, falling back to the image in `~/.config/chickenwm/bg/`.
+/// Loads the first matching `wallpaper` directive or `paper { layer = … }` stack, falling back to `~/.config/chickenwm/bg/`.
 fn load_configured_wallpaper(state: &mut PaperState, cfg: &HyprConfig) {
+    state.pause_on_battery = cfg.paper.pause_on_battery;
     if !cfg.paper.layers.is_empty() {
         let palette = cfg.theme.palette(cfg.theme.mode);
         state.load_layers(&cfg.paper.layers, &palette);
         return;
     }
-    let result = if let Some(wp) = cfg.wallpapers.first() {
+    let mon_clean = state.monitor_name.trim().trim_start_matches(r"\\.\");
+    let matching_wp = cfg
+        .wallpapers
+        .iter()
+        .find(|w| {
+            let m = w.monitor.trim().trim_start_matches(r"\\.\");
+            !m.is_empty() && m.eq_ignore_ascii_case(mon_clean)
+        })
+        .or_else(|| cfg.wallpapers.iter().find(|w| w.monitor.trim().is_empty()))
+        .or_else(|| cfg.wallpapers.first());
+    let result = if let Some(wp) = matching_wp {
         state.load_wallpaper_or_shader(&wp.path, &wp.transition)
     } else if let Some(bg) = default_background_image() {
         state.load_wallpaper_or_shader(&bg.to_string_lossy(), "fade")
@@ -462,6 +484,47 @@ fn is_obscured_by_fullscreen_window(paper_hwnd: HWND, mon_w: i32, mon_h: i32) ->
             let w = rc.right - rc.left;
             let h = rc.bottom - rc.top;
             return rc.left <= 0 && rc.top <= 0 && w >= mon_w && h >= mon_h;
+        }
+        false
+    }
+}
+
+/// Returns `true` when the interactive workstation is locked (Win+L / lock screen desktop active).
+fn is_screen_locked() -> bool {
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenInputDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+    };
+    unsafe {
+        // DESKTOP_SWITCHDESKTOP = 0x0100. When the session is locked to Winlogon, opening or
+        // querying the input desktop from the user session fails or has no foreground window.
+        let Ok(hdesk) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0100)) else {
+            return true;
+        };
+        let _ = CloseDesktop(hdesk);
+        false
+    }
+}
+
+/// Queries `GetSystemPowerStatus` in `kernel32.dll` to check whether the system is running on DC battery power (`ACLineStatus == 0`).
+fn is_on_battery_power() -> bool {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemPowerStatus(lp_system_power_status: *mut SystemPowerStatus) -> i32;
+    }
+    unsafe {
+        let mut st = SystemPowerStatus::default();
+        if GetSystemPowerStatus(&mut st) != 0 {
+            return st.ac_line_status == 0;
         }
         false
     }
@@ -518,6 +581,8 @@ async fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(PaperState::new(
         primary.width.max(320) as u32,
         primary.height.max(240) as u32,
+        primary.name.clone(),
+        cfg.paper.pause_on_battery,
     )));
     let _ = PAPER_STATE.set(Arc::clone(&state));
 
@@ -537,8 +602,18 @@ async fn main() -> Result<()> {
             async move {
                 match cmd {
                     IpcCommand::SetWallpaper {
-                        path, transition, ..
+                        path, transition, monitor
                     } => {
+                        if let Some(ref mon) = monitor {
+                            let cur = state_ipc.lock().monitor_name.clone();
+                            let m1 = mon.trim().trim_start_matches(r"\\.\");
+                            let m2 = cur.trim().trim_start_matches(r"\\.\");
+                            if !m1.is_empty() && !m1.eq_ignore_ascii_case(m2) {
+                                return IpcResponse::Ok {
+                                    message: format!("Ignored wallpaper for other monitor '{mon}'"),
+                                };
+                            }
+                        }
                         let trans = transition.unwrap_or_else(|| "fade".to_string());
                         match state_ipc.lock().load_wallpaper_or_shader(&path, &trans) {
                             Ok(()) => {
@@ -550,6 +625,29 @@ async fn main() -> Result<()> {
                             Err(e) => IpcResponse::Error {
                                 message: format!("Failed to load wallpaper '{path}': {e}"),
                             },
+                        }
+                    }
+                    IpcCommand::NotifyBarState(snap) => {
+                        let new_ws = snap.active_workspace.clamp(1, 10);
+                        let changed = {
+                            let mut st = state_ipc.lock();
+                            if st.active_workspace != new_ws {
+                                st.active_workspace = new_ws;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if changed {
+                            if let Ok((_, cur_cfg)) = load_or_init_config() {
+                                if cur_cfg.paper.layers.iter().any(|l| l.workspace.is_some()) {
+                                    load_configured_wallpaper(&mut state_ipc.lock(), &cur_cfg);
+                                    pacer_ipc.wake();
+                                }
+                            }
+                        }
+                        IpcResponse::Ok {
+                            message: "Synced workspace state with chickenwm-paper".to_string(),
                         }
                     }
                     IpcCommand::SetFramerate(fps) => {
@@ -635,6 +733,9 @@ async fn main() -> Result<()> {
 
         let mut scheduler = AdaptiveFrameScheduler::new(pacer_loop);
         let mut msg = MSG::default();
+        let mut last_power_check = std::time::Instant::now();
+        let mut on_battery = is_on_battery_power();
+        let mut screen_locked = false;
 
         loop {
             // Messages must be dispatched: WM_PAINT stays queued until the window paints, so a
@@ -644,21 +745,30 @@ async fn main() -> Result<()> {
                 DispatchMessageW(&msg);
             }
 
+            if last_power_check.elapsed() >= std::time::Duration::from_secs(2) {
+                last_power_check = std::time::Instant::now();
+                on_battery = is_on_battery_power();
+                screen_locked = is_screen_locked();
+            }
+
             let obscured = is_obscured_by_fullscreen_window(hwnd, primary.width, primary.height);
-            let active = !obscured && state_loop.lock().is_animating();
+            let pause_shaders = {
+                let st = state_loop.lock();
+                obscured || screen_locked || (st.pause_on_battery && on_battery)
+            };
+            let active = !obscured && !screen_locked && state_loop.lock().is_animating(pause_shaders);
             let dt = if active {
                 scheduler.wait_for_next_frame(true)
             } else {
-                // Idle (static image): sleep until a window message arrives — e.g. WM_PAINT when
-                // explorer's desktop disappears and uncovers us — re-checking state periodically
-                // so IPC wallpaper changes still start their transition promptly.
+                // Idle (static image or shaders paused on battery/fullscreen/lock): sleep until a
+                // window message arrives, re-checking state periodically.
                 let _ = MsgWaitForMultipleObjects(None, false, 100, QS_ALLINPUT);
                 scheduler.sample_delta_seconds()
             };
 
-            if !obscured {
+            if !obscured && !screen_locked {
                 let mut st = state_loop.lock();
-                if st.step(dt) {
+                if st.step(dt, pause_shaders) {
                     present_paper_buffer(hwnd, st.width as i32, st.height as i32, &st.composite_buffer);
                     let _ = SetWindowPos(
                         hwnd,

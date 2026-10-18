@@ -274,4 +274,16 @@ mod tests {
         blend_into(&mut out, &layer(vec![255, 0, 0, 0], "normal", 1.0));
         assert_eq!(out[0] & 0xFF_FFFF, 0, "transparent pixels leave the base alone");
     }
+
+    #[test]
+    fn layer_context_filters_monitor_and_workspace() {
+        let l1 = PaperLayer::parse(r"shader, aurora.wgsl, monitor = \\.\DISPLAY1, workspace = 2").unwrap();
+        assert!(l1.matches_context(r"\\.\DISPLAY1", 2));
+        assert!(l1.matches_context("DISPLAY1", 2));
+        assert!(!l1.matches_context(r"\\.\DISPLAY2", 2));
+        assert!(!l1.matches_context(r"\\.\DISPLAY1", 1));
+
+        let global = PaperLayer::parse("generated").unwrap();
+        assert!(global.matches_context(r"\\.\DISPLAY2", 5));
+    }
 }
